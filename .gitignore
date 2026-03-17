@@ -1,0 +1,26 @@
+# Dataset files
+data/*/videos/
+data/*/fea/
+data/*/retrieve/
+data/FakeSV/data_complete.jsonl
+data/FakeSV/data.jsonl
+data/FakeSV/vids.csv
+data/FakeTT/data_complete.jsonl
+data/FakeTT/data.jsonl
+data/FakeTT/vids.csv
+
+# Keep the vids/ split txt files (these are small and useful)
+# so don't ignore data/*/vids/
+
+# Environment
+.venv/
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Model checkpoints
+*.pth
+*.pt
