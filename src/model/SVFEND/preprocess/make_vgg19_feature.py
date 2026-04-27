@@ -1,4 +1,4 @@
-from torchvision.models import vgg19, VGG19_Weights
+from transformers import CLIPProcessor, CLIPModel
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import av
@@ -6,25 +6,17 @@ from PIL import Image
 from tqdm import tqdm
 import os
 import torch
-import torch.nn as nn
 
 
 config = [
-    ['FakeTT'], ['FVC'], ['FakeSV']
+    ['FakeTT', 'openai/clip-vit-large-patch14'], 
+    ['FakeSV', 'OFA-Sys/chinese-clip-vit-large-patch14']
 ]
 
 NUM_FRAMES = 32
 
 
-weights = VGG19_Weights.DEFAULT
-vgg19 = vgg19(weights=weights)
-vgg19.eval()
-vgg19 = vgg19.cuda()
-vgg19_features = nn.Sequential(*list(vgg19.classifier.children())[:-1])
-vgg19 = nn.Sequential(*list(vgg19.children())[:-1])
-
-
-preprocess = weights.transforms()
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def robust_frame_extraction(video_path, num_frames):
     pil_images = []
@@ -73,15 +65,12 @@ class MyDataset(Dataset):
 
 def customed_collate_fn(batch):
     vids, pil_images = zip(*batch)
-    images = []
-    for images_list in pil_images:
-        images.extend([preprocess(img) for img in images_list])
-    inputs = torch.stack(images)
-    return vids, inputs
+    frames = [frame for frames_list in pil_images for frame in frames_list]
+    return vids, frames
 
 for dataset_config in config:
     dataset = dataset_config[0]
-    output_file = os.path.join(f'data/{dataset}/fea', 'SVFEND/vgg19_features.pt')
+    output_file = os.path.join(f'data/{dataset}/fea', 'SVFEND/clip_visual_features.pt')
     
     if os.path.exists(output_file):
         print(f'Skipping {dataset} as features already exist')
@@ -91,24 +80,31 @@ for dataset_config in config:
     video_dir = f'data/{dataset}/videos'
     
     save_dict = {}
-    
-    dataloader = DataLoader(MyDataset(src_file, video_dir), batch_size=16, collate_fn=customed_collate_fn, num_workers=8)
 
-    vgg19.eval()
+    model_id = dataset_config[1]
+    if 'chinese' in model_id.lower():
+        from transformers import ChineseCLIPProcessor, ChineseCLIPModel
+        processor = ChineseCLIPProcessor.from_pretrained(model_id)
+        model = ChineseCLIPModel.from_pretrained(model_id, torch_dtype=torch.float16).to(device)
+    else:
+        processor = CLIPProcessor.from_pretrained(model_id)
+        model = CLIPModel.from_pretrained(model_id, device_map='auto')
+    model.eval()
+    
+    dataloader = DataLoader(MyDataset(src_file, video_dir), batch_size=4, collate_fn=customed_collate_fn, num_workers=2)
+
+    model.eval()
     with torch.no_grad():
         for batch in tqdm(dataloader):
-            vids, inputs = batch
-            inputs = inputs.cuda()
+            vids, frames = batch              # frames is a flat list of PIL images
             batch_size = len(vids)
-            features = vgg19(inputs)
-            features = features.view(features.size(0), -1)  
-            features = vgg19_features(features)
-            features = features.view(features.size(0), -1)  
-            features = features.view(batch_size, NUM_FRAMES, -1)
-            features = features.detach().cpu()
-            
+            inputs = processor(images=frames, return_tensors='pt').to(device)   # preprocess here
+            image_features = model.get_image_features(**inputs)                 # (batch*32, 768)
+            image_features = image_features.view(batch_size, NUM_FRAMES, -1)   # (batch, 32, 768)
+            image_features = image_features.float().detach().cpu()
+
             for i, vid in enumerate(vids):
-                save_dict[vid] = features[i]
+                save_dict[vid] = image_features[i]
 
 
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
