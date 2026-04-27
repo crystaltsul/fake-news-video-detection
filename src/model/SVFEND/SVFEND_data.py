@@ -15,9 +15,9 @@ class SVFEND_Dataset(Base_Dataset):
         self.fea_path = self.data_path / 'fea' / 'SVFEND'    
 
         self.vggishfeapath = self.fea_path / 'vggish_pre_features.pt'  # (batch, 36, dim)
-        self.framefeapath= self.fea_path / 'vgg19_features.pt' # (batch, 32, dim)
+        self.framefeapath= self.fea_path / 'clip_visual_features.pt' # (batch, 32, dim)
         self.c3dfeapath= self.fea_path / 'c3d_features.pt'
-        self.textfeapath = self.fea_path / 'fea_text.pt'
+        self.textfeapath = self.fea_path / 'fea_clip_text.pt'
         self.data = self._get_data(fold, split, task)
         # self.data['description'] = self.data['title']
 

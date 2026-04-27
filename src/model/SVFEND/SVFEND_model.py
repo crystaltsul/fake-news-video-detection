@@ -70,7 +70,7 @@ class SVFEND(nn.Module):
 
         self.text_dim = 768
         self.comment_dim = 768
-        self.img_dim = 4096
+        self.img_dim = 768 #4096
         self.video_dim = 4096
         self.num_frames = 32
         self.num_audioframes = 36
@@ -81,7 +81,7 @@ class SVFEND(nn.Module):
 
         self.dropout = dropout   
         
-        self.vggish_layer = torch.hub.load('torchvggish', 'vggish', source='github')
+        self.vggish_layer = torch.hub.load('harritaylor/torchvggish', 'vggish')
         net_structure = list(self.vggish_layer.children())      
         self.vggish_modified = nn.Sequential(*net_structure[-2:-1])
         # freeze vggish
