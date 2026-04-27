@@ -7,10 +7,6 @@ import time
 import requests
 from dotenv import load_dotenv
 
-
-# Ensure you have the OpenAI library installed:
-# pip install openai
-
 # Configuration for datasets
 config = [
     'FakeTT',
@@ -45,9 +41,8 @@ class MyDataset(Dataset):
         transcript = self.data_df[self.data_df['vid'] == vid]['transcript'].iloc[0]
         
         # read caption
-        captions = self.caption_df[self.caption_df['vid'] == vid]['captions'].iloc[0]
-        
-        captions = '\n'.join(captions)
+        ocr = self.data_df[self.data_df['vid'] == vid]['ocr'].iloc[0]
+        captions = ocr if ocr else "[No visual text detected]"
 
         return vid, title, transcript, captions
 
@@ -60,17 +55,33 @@ def collate_fn(batch):
 
 def generate_prompt(title, transcript, captions):
     """
-    Constructs a prompt for the OpenAI model using title, transcript, and captions.
+    Constructs a prompt for Llama-3 to extract deep semantic dimensions
+    from multimodal news video content: intent, stance, narrative structure,
+    and emotional framing — rather than surface-level content description.
     """
-    prompt = f"""
+    prompt = f"""You are an expert in multimodal misinformation analysis.
+
+You are given the following content from a news video:
+
 Video Title: {title}
 Audio Transcript: {transcript}
-Visual Captions: {captions}
-Suppose you are a multimodal information organizing expert.
-Organize the information from the visual, textual, and audio content of the given news video.
-Provide a concise and accurate description that effectively represents the news video's content for the purpose of video-to-video retrieval.
-The response should begin with "The video describes".
-"""
+Visual Scene Descriptions: {captions}
+
+Analyse this video across the following four dimensions:
+
+1. INTENT: What is this content trying to make the viewer believe or feel? Is it attempting to inform, persuade, deceive, or manipulate?
+2. STANCE: How is the subject matter framed? Is the framing neutral, alarmist, one-sided, or misleading? Does the visual content support or contradict the textual claims?
+3. NARRATIVE STRUCTURE: How is the story being constructed? Does it use selective emphasis, omission of context, false causality, or recontextualisation of real footage?
+4. EMOTIONAL FRAMING: What emotional response is being targeted (e.g. fear, outrage, urgency, sympathy)? How do the visuals and language work together to amplify this?
+
+Respond in the following JSON format:
+{{
+  "intent": "...",
+  "stance": "...",
+  "narrative_structure": "...",
+  "emotional_framing": "...",
+  "summary": "A single sentence beginning with 'The video attempts to' that captures the overall manipulative or informational strategy."
+}}"""
     return prompt
 
 def call_openai_api(prompt, max_retries=5, backoff_factor=2):
@@ -83,22 +94,33 @@ def call_openai_api(prompt, max_retries=5, backoff_factor=2):
         "Content-Type": "application/json"
     }
     data = {
-        "model": os.getenv('OPENAI_MODEL'),  # You can choose a different model if desired
+        "model": os.getenv('OPENAI_MODEL'),
         "messages": [
-            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "system", "content": """You are an expert in multimodal misinformation analysis. \
+You respond only in valid JSON with no additional text, preamble, or markdown formatting. \
+Your response must always contain exactly these keys: intent, stance, narrative_structure, emotional_framing, summary. \
+Each value must be a single concise string of 1-3 sentences."""},
             {"role": "user", "content": prompt}
         ],
-        "max_tokens": 512,  # Adjust based on your needs
-        "temperature": 0.7  # Adjust for creativity
+        "max_tokens": 800,
+        "temperature": 0.2
     }
 
     for attempt in range(max_retries):
         try:
             response = requests.post(url, headers=headers, json=data)
             response.raise_for_status()
-            return response.json()['choices'][0]['message']['content'].strip()
+            raw = response.json()['choices'][0]['message']['content'].strip()
+            parsed = json.loads(raw)
+            required_keys = {"intent", "stance", "narrative_structure", "emotional_framing", "summary"}
+            if not required_keys.issubset(parsed.keys()):
+                missing = required_keys - parsed.keys()
+                print(f"Warning: Missing keys in response: {missing}. Filling with empty strings.")
+                for key in missing:
+                    parsed[key] = ""
+            return parsed
         except requests.exceptions.HTTPError as e:
-            if response.status_code == 429:  # Rate limit error
+            if response.status_code == 429:
                 wait_time = backoff_factor ** attempt
                 print(f"Rate limit exceeded. Retrying in {wait_time} seconds...")
                 time.sleep(wait_time)
@@ -106,10 +128,18 @@ def call_openai_api(prompt, max_retries=5, backoff_factor=2):
                 print(f"HTTP error: {e}. Retrying...")
         except requests.exceptions.RequestException as e:
             print(f"Request error: {e}. Retrying...")
+        except json.JSONDecodeError:
+            # Try stripping markdown code fences before giving up
+            try:
+                clean = raw.replace('```json', '').replace('```', '').strip()
+                parsed = json.loads(clean)
+                return parsed
+            except json.JSONDecodeError:
+                print(f"Warning: Could not parse JSON response. Retrying...")
         except Exception as e:
             print(f"Unexpected error: {e}. Skipping this item.")
-            return "Error generating caption."
-    return "Error generating caption after multiple attempts."
+            return {"intent": "", "stance": "", "narrative_structure": "", "emotional_framing": "", "summary": ""}
+    return {"intent": "", "stance": "", "narrative_structure": "", "emotional_framing": "", "summary": ""}
 
 def generate_integrated_captions():
     """
@@ -139,7 +169,7 @@ def generate_integrated_captions():
         if os.path.exists(output_file):
             df_existing = pd.read_json(output_file, lines=True, dtype={'vid': str})
         else:
-            df_existing = pd.DataFrame(columns=['vid', 'query'])
+            df_existing = pd.DataFrame(columns=['vid', 'query', 'intent', 'stance', 'narrative_structure', 'emotional_framing'])
         pbar = tqdm(dataloader, desc=f"For {dataset_name}")
         for batch in pbar:
             vids, titles, transcripts, all_captions = batch
@@ -161,10 +191,17 @@ def generate_integrated_captions():
                 prompt = generate_prompt(title, transcript, captions)
                 
                 # Call OpenAI API to get integrated caption
-                query = call_openai_api(prompt)
+                result = call_openai_api(prompt)
                 
                 # Append new data to the DataFrame
-                new_data = pd.DataFrame([{'vid': vid, 'query': query}])
+                new_data = pd.DataFrame([{
+                    'vid': vid,
+                    'query': result.get('summary', ''),
+                    'intent': result.get('intent', ''),
+                    'stance': result.get('stance', ''),
+                    'narrative_structure': result.get('narrative_structure', ''),
+                    'emotional_framing': result.get('emotional_framing', '')
+                }])
                 df_existing = pd.concat([df_existing, new_data], ignore_index=True)
                 
                 # Save the DataFrame to the file
