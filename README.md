@@ -44,8 +44,7 @@ In particular, REAL++ achieves an average improvement of 9.31% and 22.35% in Mac
 ```sh
 ├── data    # dataset path
 │   ├── FakeSV
-│   ├── FakeTT
-│   └── FVC
+│   └── FakeTT
 ├── preprocess  # code for prepocessing data
 │   ├── make_retrieval_tensor.py
 │   ├── generate_caption_BLIP.py
@@ -73,7 +72,6 @@ We provide video IDs for each dataset splits. Due to copyright restrictions, the
 
 + [FakeSV](https://github.com/ICTMCG/FakeSV)
 + [FakeTT](https://github.com/ICTMCG/FakingRecipe)
-+ [FVC](https://github.com/MKLab-ITI/fake-video-corpus)
 
 ## Usage
 
@@ -101,14 +99,12 @@ bash run/preprocess.sh  # preprocess data for SVFEND w/ REAL
 ```sh
 python src/main.py --config-name SVFEND_FakeSV.yaml     # run SVFEND w/ REAL on FakeSV
 python src/main.py --config-name SVFEND_FakeTT.yaml     # run SVFEND w/ REAL on FakeTT
-python src/main.py --config-name SVFEND_FVC.yaml        # run SVFEND w/ REAL on FVC
 ```
 
 ### Run REAL++
 ```sh
 python src-real++/main.py --config-name SVFEND_FakeSV.yaml     # run SVFEND w/ REAL++ on FakeSV
 python src-real++/main.py --config-name SVFEND_FakeTT.yaml     # run SVFEND w/ REAL++ on FakeTT
-python src-real++/main.py --config-name SVFEND_FVC.yaml        # run SVFEND w/ REAL++ on FVC
 
 python src-real++/cross_platform_eval.py --ckpt /path/to/best_model.pth --config-name SVFEND_FakeSV.yaml     # SVFEND w/ REAL++ trained on FakeSV evaluated on FakeTT and FVC
 
