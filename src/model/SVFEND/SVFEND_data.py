@@ -15,13 +15,15 @@ class SVFEND_Dataset(Base_Dataset):
         self.fea_path = self.data_path / 'fea' / 'SVFEND'    
 
         self.vggishfeapath = self.fea_path / 'vggish_pre_features.pt'  # (batch, 36, dim)
-        self.framefeapath= self.fea_path / 'vgg19_features.pt' # (batch, 32, dim)
+        self.framefeapath= self.fea_path / 'clip_visual_features.pt' # (batch, 32, dim)
+        self.eventfeapath = self.fea_path / 'event_features.pt'
         self.c3dfeapath= self.fea_path / 'c3d_features.pt'
-        self.textfeapath = self.fea_path / 'fea_text.pt'
+        self.textfeapath = self.fea_path / 'fea_clip_text.pt'
         self.data = self._get_data(fold, split, task)
         # self.data['description'] = self.data['title']
 
         self.frame_fea = torch.load(self.framefeapath, weights_only=True)
+        self.event_fea = torch.load(self.eventfeapath, weights_only=True)
         self.c3d_fea = torch.load(self.c3dfeapath, weights_only=True)
         self.vggish_fea = torch.load(self.vggishfeapath, weights_only=True)
         self.text_fea = torch.load(self.textfeapath, weights_only=True)
@@ -47,8 +49,8 @@ class SVFEND_Dataset(Base_Dataset):
         
         text_fea_pos = torch.stack([self.text_fea[v] for v in sim_pos_vids])
         text_fea_neg = torch.stack([self.text_fea[v] for v in sim_neg_vids])
-        vision_fea_pos = torch.stack([self.frame_fea[v].mean(-2) for v in sim_pos_vids])
-        vision_fea_neg = torch.stack([self.frame_fea[v].mean(-2) for v in sim_neg_vids])
+        vision_fea_pos = torch.stack([self.event_fea[v] for v in sim_pos_vids])  # (num_pos, N, 768)
+        vision_fea_neg = torch.stack([self.event_fea[v] for v in sim_neg_vids])  # (num_neg, N, 768)
         audio_fea_pos = torch.stack([self.vggish_fea[v].mean(-2) for v in sim_pos_vids])
         audio_fea_neg = torch.stack([self.vggish_fea[v].mean(-2) for v in sim_neg_vids])
         
@@ -65,6 +67,7 @@ class SVFEND_Dataset(Base_Dataset):
             'vision_fea_neg': vision_fea_neg,
             'audio_fea_pos': audio_fea_pos,
             'audio_fea_neg': audio_fea_neg,
+            'event_fea': self.event_fea[vid],
         }
 
 class SVFEND_Collator:
@@ -108,6 +111,9 @@ class SVFEND_Collator:
         audio_fea_pos = torch.stack(audio_fea_pos)
         audio_fea_neg = [item['audio_fea_neg'] for item in batch]
         audio_fea_neg = torch.stack(audio_fea_neg)
+
+        event_fea = [item['event_fea'] for item in batch]
+        event_fea = torch.stack(event_fea)   # (batch, N, 768)
         
         return {
             'vids': vids,
@@ -122,6 +128,7 @@ class SVFEND_Collator:
             'vision_fea_neg': vision_fea_neg,
             'audio_fea_pos': audio_fea_pos,
             'audio_fea_neg': audio_fea_neg,
+            'event_fea': event_fea,
         }
         
 class FakeSV_SVFEND_Dataset(SVFEND_Dataset, FakeSV_Dataset):

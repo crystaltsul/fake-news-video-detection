@@ -15,7 +15,7 @@ from torch_geometric.nn import GCNConv, GATConv, GATv2Conv
 from torch_geometric.utils import dense_to_sparse
 
 from .coattention import CoAttention
-from ..Base.utils import orthogonal_loss, l2_loss_fn
+from ..Base.utils import orthogonal_loss, l2_loss_fn, temporal_contrastive_loss
 
 
 class ModalityProtoGenerator(nn.Module):
@@ -62,6 +62,51 @@ class AddLinear(nn.Module):
     def forward(self, x):
         return self.linear(x)
 
+class TemporalProtoGenerator(nn.Module):
+    """
+    Builds a temporally-aware prototype from a set of retrieved videos,
+    each represented as a sequence of event vectors.
+
+    Unlike ModalityProtoGenerator which collapses retrieved videos to single
+    vectors, this module preserves the event dimension so prototypes reflect
+    *where* in the narrative a manipulation pattern occurs.
+
+    Input:  x of shape (batch, num_retrieved, num_events, input_dim)
+    Output: proto of shape (batch, num_events, fea_dim)
+              — one prototype vector per event stage
+    """
+    def __init__(self, fea_dim=256, dropout=0.2):
+        super(TemporalProtoGenerator, self).__init__()
+        self.linear = nn.LazyLinear(fea_dim)
+        # Cross-video attention: for each event stage, attend across retrieved videos
+        self.cross_video_attn = nn.MultiheadAttention(
+            embed_dim=fea_dim, num_heads=4, dropout=dropout, batch_first=True
+        )
+        self.norm = nn.LayerNorm(fea_dim)
+
+    def forward(self, x):
+        # x: (batch, num_retrieved, num_events, input_dim)
+        batch, num_retrieved, num_events, _ = x.shape
+
+        x = self.linear(x)                          # (batch, num_retrieved, num_events, fea_dim)
+
+        # For each event stage independently, aggregate across the retrieved videos
+        # Reshape: treat each (batch, event_stage) as an independent sequence over retrieved videos
+        x = x.permute(0, 2, 1, 3)                  # (batch, num_events, num_retrieved, fea_dim)
+        x_flat = x.reshape(batch * num_events, num_retrieved, -1)
+                                                    # (batch*num_events, num_retrieved, fea_dim)
+
+        # Self-attention across retrieved videos at each event stage
+        attn_out, _ = self.cross_video_attn(x_flat, x_flat, x_flat)
+                                                    # (batch*num_events, num_retrieved, fea_dim)
+        attn_out = self.norm(attn_out)
+
+        # Mean-pool retrieved videos → one prototype per event stage
+        proto = attn_out.mean(dim=1)               # (batch*num_events, fea_dim)
+        proto = proto.reshape(batch, num_events, -1)  # (batch, num_events, fea_dim)
+
+        return proto
+
 class SVFEND(nn.Module):
     def __init__(self, encoder_name='bert-base-uncased', fea_dim=128, dropout=0.1, ori=False, **kargs):
         super(SVFEND, self).__init__()
@@ -70,9 +115,10 @@ class SVFEND(nn.Module):
 
         self.text_dim = 768
         self.comment_dim = 768
-        self.img_dim = 4096
+        self.img_dim = 768 #4096
         self.video_dim = 4096
         self.num_frames = 32
+        self.num_events = kargs.get('num_events', 8)
         self.num_audioframes = 36
         self.num_comments = 23
         self.dim = fea_dim
@@ -81,7 +127,7 @@ class SVFEND(nn.Module):
 
         self.dropout = dropout   
         
-        self.vggish_layer = torch.hub.load('torchvggish', 'vggish', source='github')
+        self.vggish_layer = torch.hub.load('harritaylor/torchvggish', 'vggish')
         net_structure = list(self.vggish_layer.children())      
         self.vggish_modified = nn.Sequential(*net_structure[-2:-1])
         # freeze vggish
@@ -91,7 +137,7 @@ class SVFEND(nn.Module):
         self.co_attention_ta = CoAttention(d_k=fea_dim, d_v=fea_dim, n_heads=self.num_heads, dropout=self.dropout, d_model=fea_dim,
                                         visual_len=self.num_audioframes, sen_len=512, fea_v=self.dim, fea_s=self.dim, pos=False)
         self.co_attention_tv = CoAttention(d_k=fea_dim, d_v=fea_dim, n_heads=self.num_heads, dropout=self.dropout, d_model=fea_dim,
-                                        visual_len=self.num_frames, sen_len=512, fea_v=self.dim, fea_s=self.dim, pos=False)
+                                        visual_len=self.num_events, sen_len=512, fea_v=self.dim, fea_s=self.dim, pos=False)
         self.trm = nn.TransformerEncoderLayer(d_model=self.dim, nhead=2, dropout=dropout, batch_first=True)
 
 
@@ -106,18 +152,19 @@ class SVFEND(nn.Module):
         
         self.text_pos_self_attn = ModalityProtoGenerator(fea_dim, dropout)
         self.text_neg_self_attn = ModalityProtoGenerator(fea_dim, dropout)
-        self.vision_pos_self_attn = ModalityProtoGenerator(fea_dim, dropout)
-        self.vision_neg_self_attn = ModalityProtoGenerator(fea_dim, dropout)
+        self.vision_pos_self_attn = TemporalProtoGenerator(fea_dim, dropout)
+        self.vision_neg_self_attn = TemporalProtoGenerator(fea_dim, dropout)
         self.audio_pos_self_attn = ModalityProtoGenerator(fea_dim, dropout)
         self.audio_neg_self_attn = ModalityProtoGenerator(fea_dim, dropout)
         
         self.add_linear_text = AddLinear(fea_dim)
         self.add_linear_vision = AddLinear(fea_dim)
+        self.add_linear_vision_event = AddLinear(fea_dim)
         self.add_linear_audio = AddLinear(fea_dim)
         self.ori = ori
-        self.alpha = 0.01
-        self.beta = 0.01
-
+        self.alpha = kargs.get('alpha', 0.01)
+        self.beta  = kargs.get('beta',  0.01)
+        self.gamma = kargs.get('gamma', 0.01)
 
     def forward(self, **kwargs):
         fea_text_pos = kwargs['text_fea_pos']
@@ -135,6 +182,7 @@ class SVFEND(nn.Module):
         fea_audio = self.linear_audio(fea_audio) 
         
         frames=kwargs['frames']
+        event_fea = kwargs['event_fea']
         fea_img = self.linear_img(frames)
         
         text_pos_proto = self.text_pos_self_attn(fea_text_pos)
@@ -145,11 +193,13 @@ class SVFEND(nn.Module):
         audio_neg_proto = self.audio_neg_self_attn(fea_audio_neg)
         
         add_fea_text = self.add_linear_text(fea_text)
-        add_fea_vision = self.add_linear_vision(fea_img)
+        add_fea_vision = self.add_linear_vision(fea_img)          # (batch, 32, fea_dim) for co-attention
+        add_fea_vision_event = self.add_linear_vision_event(event_fea)    # (batch, 8, fea_dim) for temporal loss
         add_fea_audio = self.add_linear_audio(fea_audio)
         
         add_fea_text_opt = add_fea_text
         add_fea_vision_opt = add_fea_vision.mean(-2)
+        add_fea_vision_seq = add_fea_vision_event
         add_fea_audio_opt = add_fea_audio.mean(-2)
         
         ori_fea_text = fea_text.clone()
@@ -214,6 +264,7 @@ class SVFEND(nn.Module):
             'audio_neg_proto': audio_neg_proto,
             'add_fea_text': add_fea_text_opt,
             'add_fea_vision': add_fea_vision_opt,
+            'add_fea_vision_seq': add_fea_vision_seq,
             'add_fea_audio': add_fea_audio_opt,
             'ori': self.ori,
             'ori_fea_text': ori_fea_text,
@@ -255,10 +306,10 @@ class SVFEND(nn.Module):
             text_orth_pos = orthogonal_loss(fea_text, text_neg_proto, label_pos)
             text_orth_neg = orthogonal_loss(fea_text, text_pos_proto, label_neg)
             
-            vision_l2_pos = l2_loss_fn(fea_vision, vision_pos_proto, label_pos)
-            vision_l2_neg = l2_loss_fn(fea_vision, vision_neg_proto, label_neg)
-            vision_orth_pos = orthogonal_loss(fea_vision, vision_neg_proto, label_pos)
-            vision_orth_neg = orthogonal_loss(fea_vision, vision_pos_proto, label_neg)
+            vision_l2_pos = l2_loss_fn(fea_vision, vision_pos_proto.mean(1), label_pos)
+            vision_l2_neg = l2_loss_fn(fea_vision, vision_neg_proto.mean(1), label_neg)
+            vision_orth_pos = orthogonal_loss(fea_vision, vision_neg_proto.mean(1), label_pos)
+            vision_orth_neg = orthogonal_loss(fea_vision, vision_pos_proto.mean(1), label_neg)
 
             audio_l2_pos = l2_loss_fn(fea_audio, audio_pos_proto, label_pos)
             audio_l2_neg = l2_loss_fn(fea_audio, audio_neg_proto, label_neg)
@@ -269,7 +320,15 @@ class SVFEND(nn.Module):
             orth_loss += text_orth_pos + vision_orth_pos + audio_orth_pos
             l2_loss += text_l2_neg + vision_l2_neg + audio_l2_neg
             orth_loss += text_orth_neg + vision_orth_neg + audio_orth_neg
-            
+
             cls_loss = F.cross_entropy(pred, labels)
-            loss = cls_loss + self.alpha * l2_loss + self.beta * orth_loss
+
+            temporal_loss = temporal_contrastive_loss(
+                kwargs['add_fea_vision_seq'],   # see Bug B below
+                vision_pos_proto,
+                vision_neg_proto,
+                labels
+            )
+
+            loss = cls_loss + self.alpha * l2_loss + self.beta * orth_loss + self.gamma * temporal_loss
             return loss, cls_loss
