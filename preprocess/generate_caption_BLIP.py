@@ -4,16 +4,16 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from tqdm import tqdm
 import torch
-from transformers import AutoProcessor, AutoModelForCausalLM, Blip2ForConditionalGeneration
+from transformers import CLIPProcessor, CLIPModel
 
-# Configuration for datasets and the BLIP2 model
+# Configuration for datasets and the CLIP model
 config = [
-    ['FakeSV', 'Salesforce/blip2-opt-2.7b'],
-    ['FakeTT', 'Salesforce/blip2-opt-2.7b'],
+    ['FakeSV', 'openai/clip-vit-large-patch14'],
+    ['FakeTT', 'openai/clip-vit-large-patch14'],
 ]
 
 dataset_dir_base = 'data'  # Base directory for datasets
-frames_path = 'frames_16'  # Directory where frames are stored
+frames_path = 'frames_32'  # Directory where frames are stored; more frames give better temporal visual coverage for semantic grounding
 
 class MyDataset(Dataset):
     """
@@ -31,7 +31,7 @@ class MyDataset(Dataset):
     def __getitem__(self, idx):
         vid = self.vids[idx]
         frames = []
-        for i in range(16):  # Assuming 16 frames per video
+        for i in range(32):  # Assuming 32 frames per video
             frame_path = os.path.join(
                 self.dataset_dir,
                 frames_path,
@@ -57,7 +57,7 @@ def collate_fn(batch):
 
 def generate_captions():
     """
-    Main function to generate captions for each frame in the datasets.
+   Main function to generate CLIP vision-text embeddings and semantic descriptions for each frame.
     """
     for cfg in config:
         dataset_name, model_id = cfg
@@ -69,9 +69,9 @@ def generate_captions():
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         
         print(f"Loading model: {model_id}")
-        # Load the BLIP2 processor and model
-        processor = AutoProcessor.from_pretrained(model_id)
-        model = Blip2ForConditionalGeneration.from_pretrained(model_id)
+        # Load the CLIP processor and model
+        processor = CLIPProcessor.from_pretrained(model_id) 
+        model = CLIPModel.from_pretrained(model_id)
         
         # Move model to the appropriate device
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -96,22 +96,20 @@ def generate_captions():
             with open(output_file, 'w', encoding='utf-8') as f_out:
                 for vids, all_frames in tqdm(dataloader, desc=f"Generating captions for {dataset_name}"):
                     # Move frames to device
-                    inputs = processor(images=all_frames, return_tensors="pt").to(device)
+                    # CLIP requires both image and text inputs for joint embedding
+                    inputs = processor(images=all_frames, text=["a photo of news content"]*len(all_frames), return_tensors="pt", padding=True).to(device)
                     
-                    # Generate captions
-                    outputs = model.generate(**inputs, max_new_tokens=50)  # Adjust max_new_tokens as needed
-                    
-                    # Decode captions
-                    captions = processor.batch_decode(outputs, skip_special_tokens=True)
+                    image_features = model.get_image_features(pixel_values=inputs['pixel_values'])
                     
                     # Group captions per video
                     batch_size = len(vids)
                     for i in range(batch_size):
                         vid = vids[i]
-                        video_captions = captions[i*16:(i+1)*16]  # Assuming 16 frames per video
+                        video_embeddings = image_features[i*32:(i+1)*32].tolist()  # Assuming 32 frames per video
                         json_line = json.dumps({
                             'vid': vid,
-                            'captions': video_captions
+                            'clip_embeddings': video_embeddings,
+                            'frame_indices': list(range(32))
                         }, ensure_ascii=False)
                         f_out.write(json_line + '\n')
         
