@@ -99,3 +99,49 @@ def l2_loss_fn(p, q, mask=None):
         l2 = l2.mean()
     
     return l2
+
+def temporal_contrastive_loss(fea_vision, pos_proto, neg_proto, labels, temperature=0.1):
+    """
+    Temporal contrastive loss operating over event-stage sequences.
+
+    For each video in the batch, pushes its event sequence toward the
+    positive prototype (same label) and away from the negative prototype
+    (opposite label) at every temporal stage independently.
+
+    Args:
+        fea_vision:  (batch, num_events, fea_dim)  — current video event features
+                     This is add_fea_vision before mean-pooling, i.e. the
+                     per-event manipulation-aware representation.
+        pos_proto:   (batch, num_events, fea_dim)  — positive prototype per event
+        neg_proto:   (batch, num_events, fea_dim)  — negative prototype per event
+        labels:      (batch,) — 0 = real, 1 = fake
+        temperature: scaling factor for cosine similarity
+
+    Returns:
+        Scalar loss.
+    """
+    # L2-normalise along the feature dimension for cosine similarity
+    fea   = F.normalize(fea_vision, dim=-1)   # (batch, num_events, fea_dim)
+    pos_p = F.normalize(pos_proto,  dim=-1)   # (batch, num_events, fea_dim)
+    neg_p = F.normalize(neg_proto,  dim=-1)   # (batch, num_events, fea_dim)
+
+    # Per-event cosine similarities
+    sim_pos = (fea * pos_p).sum(dim=-1) / temperature   # (batch, num_events)
+    sim_neg = (fea * neg_p).sum(dim=-1) / temperature   # (batch, num_events)
+
+    # InfoNCE-style: log(exp(sim_pos) / (exp(sim_pos) + exp(sim_neg)))
+    # Averaged across event stages first, then across the batch
+    logits = torch.stack([sim_pos, sim_neg], dim=-1)    # (batch, num_events, 2)
+
+    # Target: index 0 (pos) for real videos (label=0), index 1 (neg) for fake (label=1)
+    # Real videos should be close to real prototypes; fake to fake prototypes
+    targets = labels.unsqueeze(1).expand(-1, fea.shape[1])  # (batch, num_events)
+
+    # Cross-entropy over the 2-class (pos/neg) logits at each event stage
+    batch, num_events, _ = logits.shape
+    loss = F.cross_entropy(
+        logits.reshape(batch * num_events, 2),
+        targets.reshape(batch * num_events),
+    )
+
+    return loss
