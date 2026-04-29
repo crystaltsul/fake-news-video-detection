@@ -83,6 +83,7 @@ class TemporalProtoGenerator(nn.Module):
             embed_dim=fea_dim, num_heads=4, dropout=dropout, batch_first=True
         )
         self.norm = nn.LayerNorm(fea_dim)
+        self.proto_dropout = nn.Dropout(p=dropout)
 
     def forward(self, x):
         # x: (batch, num_retrieved, num_events, input_dim)
@@ -98,12 +99,14 @@ class TemporalProtoGenerator(nn.Module):
 
         # Self-attention across retrieved videos at each event stage
         attn_out, _ = self.cross_video_attn(x_flat, x_flat, x_flat)
+        attn_out = attn_out / (x_flat.shape[-1] ** 0.5)  # scale by sqrt(fea_dim)
                                                     # (batch*num_events, num_retrieved, fea_dim)
         attn_out = self.norm(attn_out)
 
         # Mean-pool retrieved videos → one prototype per event stage
         proto = attn_out.mean(dim=1)               # (batch*num_events, fea_dim)
         proto = proto.reshape(batch, num_events, -1)  # (batch, num_events, fea_dim)
+        proto = self.proto_dropout(proto)
 
         return proto
 
@@ -124,6 +127,7 @@ class SVFEND(nn.Module):
         self.dim = fea_dim
         self.num_heads = 4
         self.audio_dim = 12288
+        self.diversity_threshold = kargs.get('diversity_threshold', 0.05)
 
         self.dropout = dropout   
         
@@ -137,7 +141,7 @@ class SVFEND(nn.Module):
         self.co_attention_ta = CoAttention(d_k=fea_dim, d_v=fea_dim, n_heads=self.num_heads, dropout=self.dropout, d_model=fea_dim,
                                         visual_len=self.num_audioframes, sen_len=512, fea_v=self.dim, fea_s=self.dim, pos=False)
         self.co_attention_tv = CoAttention(d_k=fea_dim, d_v=fea_dim, n_heads=self.num_heads, dropout=self.dropout, d_model=fea_dim,
-                                        visual_len=self.num_events, sen_len=512, fea_v=self.dim, fea_s=self.dim, pos=False)
+                                        visual_len=self.num_frames, sen_len=512, fea_v=self.dim, fea_s=self.dim, pos=False)
         self.trm = nn.TransformerEncoderLayer(d_model=self.dim, nhead=2, dropout=dropout, batch_first=True)
 
 
@@ -323,12 +327,26 @@ class SVFEND(nn.Module):
 
             cls_loss = F.cross_entropy(pred, labels)
 
+            event_seq = kwargs['add_fea_vision_seq']
+            normed = F.normalize(event_seq, dim=-1)
+            diversity = 1 - (normed @ normed.transpose(-1, -2)).mean(dim=(-1, -2))  # (batch,)
+            diverse_mask = (diversity > self.diversity_threshold).float().detach() # (batch,)
+
             temporal_loss = temporal_contrastive_loss(
-                kwargs['add_fea_vision_seq'],   # see Bug B below
-                vision_pos_proto,
-                vision_neg_proto,
-                labels
+                event_seq, vision_pos_proto, vision_neg_proto, labels
             )
+            # Scale by diversity mask — zero contribution for static videos
+            temporal_loss = (temporal_loss * diverse_mask).mean()
 
             loss = cls_loss + self.alpha * l2_loss + self.beta * orth_loss + self.gamma * temporal_loss
             return loss, cls_loss
+
+            # temporal_loss = temporal_contrastive_loss(
+            #     kwargs['add_fea_vision_seq'],   # see Bug B below
+            #     vision_pos_proto,
+            #     vision_neg_proto,
+            #     labels
+            # )
+
+            # loss = cls_loss + self.alpha * l2_loss + self.beta * orth_loss + self.gamma * temporal_loss
+            # return loss, cls_loss

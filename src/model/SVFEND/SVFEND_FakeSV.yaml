@@ -8,7 +8,11 @@ data:
   num_neg: 5
 para:
   num_events: 8
-  gamma: 0.01
+  gamma: 0.005
+  alpha: 0.01
+  beta: 0.01
+  diversity_threshold: 0.03
+  max_norm: 1.0
 opt:
   name: Adam
   lr: 1e-4
@@ -22,4 +26,4 @@ seed: 2024
 model: SVFEND
 dataset: FakeSV
 type: default
-patience: 5
+patience: 8
