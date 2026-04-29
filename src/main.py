@@ -194,6 +194,8 @@ class Trainer():
             loss_pre_list.append(loss_pred.item())
 
             loss.backward()
+            max_norm = OmegaConf.select(self.cfg, 'para.max_norm', default=1.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=max_norm)
             self.optimizer.step()
             self.optimizer.zero_grad()
             self.scheduler.step()
