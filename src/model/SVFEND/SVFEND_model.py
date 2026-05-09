@@ -82,10 +82,14 @@ class TemporalProtoGenerator(nn.Module):
         self.cross_video_attn = nn.MultiheadAttention(
             embed_dim=fea_dim, num_heads=4, dropout=dropout, batch_first=True
         )
+        self.text_gate = nn.Sequential(
+            nn.LazyLinear(fea_dim),
+            nn.Sigmoid()
+        )
         self.norm = nn.LayerNorm(fea_dim)
         self.proto_dropout = nn.Dropout(p=dropout)
 
-    def forward(self, x):
+    def forward(self, x, text_proto=None):
         # x: (batch, num_retrieved, num_events, input_dim)
         batch, num_retrieved, num_events, _ = x.shape
 
@@ -106,6 +110,13 @@ class TemporalProtoGenerator(nn.Module):
         # Mean-pool retrieved videos → one prototype per event stage
         proto = attn_out.mean(dim=1)               # (batch*num_events, fea_dim)
         proto = proto.reshape(batch, num_events, -1)  # (batch, num_events, fea_dim)
+        
+        if text_proto is not None:
+            # text_proto: (batch, fea_dim) — expand across events
+            gate = self.text_gate(text_proto)            # (batch, fea_dim)
+            gate = gate.unsqueeze(1).expand_as(proto)   # (batch, num_events, fea_dim)
+            proto = proto * gate
+        
         proto = self.proto_dropout(proto)
 
         return proto
@@ -128,6 +139,7 @@ class SVFEND(nn.Module):
         self.num_heads = 4
         self.audio_dim = 12288
         self.diversity_threshold = kargs.get('diversity_threshold', 0.05)
+        self.tcl_temperature = kargs.get('tcl_temperature', 0.1)
 
         self.dropout = dropout   
         
@@ -150,7 +162,8 @@ class SVFEND(nn.Module):
         self.linear_img = nn.Sequential(torch.nn.Linear(self.img_dim, fea_dim), torch.nn.ReLU(),nn.Dropout(p=self.dropout))
         self.linear_video = nn.Sequential(torch.nn.Linear(self.video_dim, fea_dim), torch.nn.ReLU(),nn.Dropout(p=self.dropout))
         self.linear_intro = nn.Sequential(torch.nn.Linear(self.text_dim, fea_dim),torch.nn.ReLU(),nn.Dropout(p=self.dropout))
-        self.linear_audio = nn.Sequential(torch.nn.Linear(fea_dim, fea_dim), torch.nn.ReLU(),nn.Dropout(p=self.dropout))
+        # self.linear_audio = nn.Sequential(torch.nn.Linear(fea_dim, fea_dim), torch.nn.ReLU(),nn.Dropout(p=self.dropout))
+        self.linear_audio = nn.Sequential(nn.LazyLinear(fea_dim), torch.nn.ReLU(), nn.Dropout(p=self.dropout))
 
         self.classifier = nn.Linear(fea_dim,2)
         
@@ -191,8 +204,8 @@ class SVFEND(nn.Module):
         
         text_pos_proto = self.text_pos_self_attn(fea_text_pos)
         text_neg_proto = self.text_neg_self_attn(fea_text_neg)
-        vision_pos_proto = self.vision_pos_self_attn(fea_vision_pos)
-        vision_neg_proto = self.vision_neg_self_attn(fea_vision_neg)
+        vision_pos_proto = self.vision_pos_self_attn(fea_vision_pos, text_proto=text_pos_proto)
+        vision_neg_proto = self.vision_neg_self_attn(fea_vision_neg, text_proto=text_neg_proto)
         audio_pos_proto = self.audio_pos_self_attn(fea_audio_pos)
         audio_neg_proto = self.audio_neg_self_attn(fea_audio_neg)
         
@@ -277,6 +290,7 @@ class SVFEND(nn.Module):
             'ma_fea_text': ma_fea_text,
             'ma_fea_vision': ma_fea_vision,
             'ma_fea_audio': ma_fea_audio,
+            'raw_event_fea': event_fea,
         }
     
     def cal_loss(self, **kwargs):
@@ -328,25 +342,35 @@ class SVFEND(nn.Module):
             cls_loss = F.cross_entropy(pred, labels)
 
             event_seq = kwargs['add_fea_vision_seq']
-            normed = F.normalize(event_seq, dim=-1)
+            raw_event = kwargs['raw_event_fea']
+            normed = F.normalize(raw_event.float(), dim=-1)
             diversity = 1 - (normed @ normed.transpose(-1, -2)).mean(dim=(-1, -2))  # (batch,)
-            diverse_mask = (diversity > self.diversity_threshold).float().detach() # (batch,)
+            diverse_mask = (diversity > self.diversity_threshold).float().detach()
 
-            temporal_loss = temporal_contrastive_loss(
-                event_seq, vision_pos_proto, vision_neg_proto, labels
+            # Log how many videos pass the diversity gate
+            diverse_count = diverse_mask.sum().item()
+            batch_size = diverse_mask.shape[0]
+
+            if diverse_mask.bool().any():
+                temporal_loss = temporal_contrastive_loss(
+                    event_seq[diverse_mask.bool()],
+                    vision_pos_proto[diverse_mask.bool()],
+                    vision_neg_proto[diverse_mask.bool()],
+                    labels[diverse_mask.bool()],
+                    temperature=self.tcl_temperature
+                )
+            else:
+                temporal_loss = torch.tensor(0.0, device=labels.device)
+
+            # Debug logging — remove after tuning
+            print(
+                f"[cal_loss] cls={cls_loss.item():.4f} "
+                f"l2={l2_loss:.4f} "
+                f"orth={orth_loss:.4f} "
+                f"temporal={temporal_loss.item():.4f} "
+                f"diverse={diverse_count}/{batch_size} "
+                f"gamma*temporal={self.gamma * temporal_loss.item():.6f}"
             )
-            # Scale by diversity mask — zero contribution for static videos
-            temporal_loss = (temporal_loss * diverse_mask).mean()
 
             loss = cls_loss + self.alpha * l2_loss + self.beta * orth_loss + self.gamma * temporal_loss
             return loss, cls_loss
-
-            # temporal_loss = temporal_contrastive_loss(
-            #     kwargs['add_fea_vision_seq'],   # see Bug B below
-            #     vision_pos_proto,
-            #     vision_neg_proto,
-            #     labels
-            # )
-
-            # loss = cls_loss + self.alpha * l2_loss + self.beta * orth_loss + self.gamma * temporal_loss
-            # return loss, cls_loss

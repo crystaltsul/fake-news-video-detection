@@ -8,11 +8,12 @@ data:
   num_neg: 5
 para:
   num_events: 8
-  gamma: 0.005
+  gamma: 0.05
   alpha: 0.01
   beta: 0.01
-  diversity_threshold: 0.03
+  diversity_threshold: 0.001
   max_norm: 1.0
+  tcl_temperature: 0.1
 opt:
   name: Adam
   lr: 1e-4

@@ -30,6 +30,28 @@ class SVFEND_Dataset(Base_Dataset):
         self.sim_df = pd.read_json(self.data_path / 'retrieve/sim.jsonl', lines=True, dtype={'vid': str})
         self.num_pos = num_pos
         self.num_neg = num_neg
+
+        other_dataset = 'FakeTT' if 'FakeSV' in str(self.data_path) else 'FakeSV'
+        other_fea_path = self.data_path.parent / other_dataset / 'fea' / 'SVFEND'
+
+        if other_fea_path.exists():
+            other_text_fea   = torch.load(other_fea_path / 'fea_clip_text.pt',        weights_only=True)
+            other_event_fea  = torch.load(other_fea_path / 'event_features.pt',       weights_only=True)
+            other_vggish_fea = torch.load(other_fea_path / 'vggish_pre_features.pt',  weights_only=True)
+            # Merge — current dataset takes priority if IDs overlap
+            self.text_fea   = {**other_text_fea,   **self.text_fea}
+            self.event_fea  = {**other_event_fea,  **self.event_fea}
+            self.vggish_fea = {**other_vggish_fea, **self.vggish_fea}
+            print(f"[SVFEND_Dataset] Merged cross-domain features from {other_dataset}")
+            print(f"  text_fea: {len(self.text_fea)} total IDs")
+            print(f"  event_fea: {len(self.event_fea)} total IDs")
+            print(f"  vggish_fea: {len(self.vggish_fea)} total IDs")
+        else:
+            print(f"[SVFEND_Dataset] Warning: cross-domain path not found: {other_fea_path}")
+
+        self.sim_df  = pd.read_json(self.data_path / 'retrieve/sim.jsonl', lines=True, dtype={'vid': str})
+        self.num_pos = num_pos
+        self.num_neg = num_neg
         
     def __len__(self):
         return len(self.data)
@@ -44,16 +66,48 @@ class SVFEND_Dataset(Base_Dataset):
         c3d = self.c3d_fea[vid]
         text_fea = self.text_fea[vid]
         
-        sim_pos_vids = [v for v in self.sim_df[self.sim_df['vid'] == vid].iloc[0]['similarities'][0]['vid'][:self.num_pos]]
-        sim_neg_vids = [v for v in self.sim_df[self.sim_df['vid'] == vid].iloc[0]['similarities'][1]['vid'][:self.num_neg]]
+        # sim_pos_vids = [v for v in self.sim_df[self.sim_df['vid'] == vid].iloc[0]['similarities'][0]['vid'][:self.num_pos]]
+        # sim_neg_vids = [v for v in self.sim_df[self.sim_df['vid'] == vid].iloc[0]['similarities'][1]['vid'][:self.num_neg]]
         
-        text_fea_pos = torch.stack([self.text_fea[v] for v in sim_pos_vids])
-        text_fea_neg = torch.stack([self.text_fea[v] for v in sim_neg_vids])
-        vision_fea_pos = torch.stack([self.event_fea[v] for v in sim_pos_vids])  # (num_pos, N, 768)
-        vision_fea_neg = torch.stack([self.event_fea[v] for v in sim_neg_vids])  # (num_neg, N, 768)
-        audio_fea_pos = torch.stack([self.vggish_fea[v].mean(-2) for v in sim_pos_vids])
-        audio_fea_neg = torch.stack([self.vggish_fea[v].mean(-2) for v in sim_neg_vids])
+        # text_fea_pos = torch.stack([self.text_fea[v] for v in sim_pos_vids])
+        # text_fea_neg = torch.stack([self.text_fea[v] for v in sim_neg_vids])
+        # vision_fea_pos = torch.stack([self.event_fea[v] for v in sim_pos_vids])  # (num_pos, N, 768)
+        # vision_fea_neg = torch.stack([self.event_fea[v] for v in sim_neg_vids])  # (num_neg, N, 768)
+        # audio_fea_pos = torch.stack([self.vggish_fea[v].mean(-2) for v in sim_pos_vids])
+        # audio_fea_neg = torch.stack([self.vggish_fea[v].mean(-2) for v in sim_neg_vids])
         
+        sim_pos_vids = [v for v in self.sim_df[self.sim_df['vid'] == vid].iloc[0]['similarities'][0]['vid'][:self.num_pos]
+                        if v in self.text_fea and v in self.event_fea and v in self.vggish_fea]
+        sim_neg_vids = [v for v in self.sim_df[self.sim_df['vid'] == vid].iloc[0]['similarities'][1]['vid'][:self.num_neg]
+                        if v in self.text_fea and v in self.event_fea and v in self.vggish_fea]
+
+        all_pos_candidates = [v for v in self.sim_df[self.sim_df['vid'] == vid].iloc[0]['similarities'][0]['vid']
+                            if v in self.text_fea and v in self.event_fea and v in self.vggish_fea]
+        all_neg_candidates = [v for v in self.sim_df[self.sim_df['vid'] == vid].iloc[0]['similarities'][1]['vid']
+                            if v in self.text_fea and v in self.event_fea and v in self.vggish_fea]
+
+        # Use as many as available up to num_pos/num_neg, never pad with self
+        sim_pos_vids = all_pos_candidates[:self.num_pos]
+        sim_neg_vids = all_neg_candidates[:self.num_neg]
+
+        # If still not enough, skip this sample rather than corrupt the batch
+        # The collator handles variable-length batches via padding at the batch level
+        if len(sim_pos_vids) == 0 or len(sim_neg_vids) == 0:
+            # Fall back to random same-label videos from the dataset
+            same_label = self.data[self.data['label'] == label]['vid'].tolist()
+            opp_label  = self.data[self.data['label'] != label]['vid'].tolist()
+            while len(sim_pos_vids) < self.num_pos:
+                sim_pos_vids.append(same_label[len(sim_pos_vids) % len(same_label)])
+            while len(sim_neg_vids) < self.num_neg:
+                sim_neg_vids.append(opp_label[len(sim_neg_vids) % len(opp_label)])
+
+        text_fea_pos   = torch.stack([self.text_fea[v] for v in sim_pos_vids])
+        text_fea_neg   = torch.stack([self.text_fea[v] for v in sim_neg_vids])
+        vision_fea_pos = torch.stack([self.event_fea[v] for v in sim_pos_vids])
+        vision_fea_neg = torch.stack([self.event_fea[v] for v in sim_neg_vids])
+        audio_fea_pos  = torch.stack([self.vggish_fea[v].mean(-2) for v in sim_pos_vids])
+        audio_fea_neg  = torch.stack([self.vggish_fea[v].mean(-2) for v in sim_neg_vids])
+
         return {
             'vid': vid,
             'label': torch.tensor(label),
