@@ -27,31 +27,18 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-# ---------------------------------------------------------------------------
 # Configuration
-# ---------------------------------------------------------------------------
-
 config = [
-    'FakeSV',
-    'FakeTT',
+    {'dataset': 'FakeSV', 'shot_threshold': 0.25, 'num_events': 8},
+    {'dataset': 'FakeTT', 'shot_threshold': 0.15, 'num_events': 8},
 ]
 
 dataset_dir_base = 'data'
-NUM_FRAMES = 32         # frames per video in clip_visual_features.pt
-NUM_EVENTS = 8          # fixed output length (shots padded / truncated to this)
-SHOT_THRESHOLD = 0.25   # cosine-distance threshold for declaring a shot boundary
-                        # lower  → more sensitive, more shots detected
-                        # higher → fewer, coarser segments
-                        # 0.25 is a reasonable default for CLIP embeddings;
-                        # tune on a small held-out set if needed
+NUM_FRAMES = 32
 
-
-# ---------------------------------------------------------------------------
 # Shot boundary detection
-# ---------------------------------------------------------------------------
-
 def detect_shot_boundaries(frame_embeddings: torch.Tensor,
-                           threshold: float = SHOT_THRESHOLD) -> list[int]:
+                           threshold: float = 0.25) -> list[int]:
     """
     Detect shot boundaries in a sequence of normalised frame embeddings.
 
@@ -83,13 +70,10 @@ def detect_shot_boundaries(frame_embeddings: torch.Tensor,
     return boundaries
 
 
-# ---------------------------------------------------------------------------
 # Event pooling
-# ---------------------------------------------------------------------------
-
 def pool_shots_to_events(frame_embeddings: torch.Tensor,
                          boundaries: list[int],
-                         num_events: int = NUM_EVENTS) -> torch.Tensor:
+                         num_events: int = 8) -> torch.Tensor:
     """
     Mean-pool frames within each shot to produce one event vector per shot,
     then pad or truncate the shot sequence to exactly `num_events` vectors.
@@ -134,13 +118,10 @@ def pool_shots_to_events(frame_embeddings: torch.Tensor,
     return event_tensor
 
 
-# ---------------------------------------------------------------------------
 # Per-video processing
-# ---------------------------------------------------------------------------
-
 def compute_event_features(frame_features: dict[str, torch.Tensor],
-                            num_events: int = NUM_EVENTS,
-                            threshold: float = SHOT_THRESHOLD
+                            num_events: int = 8,
+                            threshold: float = 0.25
                             ) -> dict[str, torch.Tensor]:
     """
     Process every video in `frame_features` and return a new dict mapping
@@ -166,12 +147,10 @@ def compute_event_features(frame_features: dict[str, torch.Tensor],
     return event_features
 
 
-# ---------------------------------------------------------------------------
 # Diagnostics helper (optional but useful during development)
-# ---------------------------------------------------------------------------
-
 def print_segmentation_stats(frame_features: dict[str, torch.Tensor],
-                              threshold: float = SHOT_THRESHOLD) -> None:
+                              threshold: float = 0.25,
+                              num_events: int = 8) -> None:
     """
     Print a brief summary of detected shot counts across the dataset.
     Helps calibrate SHOT_THRESHOLD before committing to a full run.
@@ -188,17 +167,18 @@ def print_segmentation_stats(frame_features: dict[str, torch.Tensor],
           f"mean: {shot_counts_t.mean().item():.1f}  "
           f"max: {shot_counts_t.max().item():.0f}")
     under = (shot_counts_t < 2).sum().item()
-    over  = (shot_counts_t > NUM_EVENTS).sum().item()
+    over  = (shot_counts_t > num_events).sum().item()
     print(f"  Videos with <2 shots (no boundary detected): {under}")
-    print(f"  Videos with >{NUM_EVENTS} shots (will be truncated): {over}")
+    print(f"  Videos with >{num_events} shots (will be truncated): {over}")
 
 
-# ---------------------------------------------------------------------------
 # Main
-# ---------------------------------------------------------------------------
-
 def main():
-    for dataset_name in config:
+    for cfg in config:
+        dataset_name = cfg['dataset']
+        shot_threshold = cfg['shot_threshold']
+        num_events = cfg['num_events']
+
         print(f"\n{'='*60}")
         print(f"Processing dataset: {dataset_name}")
         print(f"{'='*60}")
@@ -224,22 +204,22 @@ def main():
               f"frame tensor shape: {next(iter(frame_features.values())).shape}")
 
         # Print calibration stats before running
-        print(f"\n  Shot segmentation diagnostics (threshold={SHOT_THRESHOLD}):")
-        print_segmentation_stats(frame_features, threshold=SHOT_THRESHOLD)
+        print(f"\n  Shot segmentation diagnostics (threshold={shot_threshold}):")
+        print_segmentation_stats(frame_features, threshold=shot_threshold, num_events=num_events)
 
         print(f"\n  Computing event features  "
-              f"(NUM_EVENTS={NUM_EVENTS}, threshold={SHOT_THRESHOLD}) ...")
+              f"(NUM_EVENTS={num_events}, threshold={shot_threshold}) ...")
         event_features = compute_event_features(
             frame_features,
-            num_events=NUM_EVENTS,
-            threshold=SHOT_THRESHOLD,
+            num_events=num_events,
+            threshold=shot_threshold,
         )
 
         # Sanity check output shape
         sample_vid = next(iter(event_features))
         sample_shape = event_features[sample_vid].shape
-        assert sample_shape == (NUM_EVENTS, 768), \
-            f"Expected ({NUM_EVENTS}, 768), got {sample_shape}"
+        assert sample_shape == (num_events, 768), \
+            f"Expected ({num_events}, 768), got {sample_shape}"
 
         os.makedirs(fea_dir, exist_ok=True)
         torch.save(event_features, output_file)
